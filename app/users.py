@@ -2,8 +2,11 @@ from fastapi import APIRouter, HTTPException
 import jwt
 from sqlalchemy.orm import Session
 from fastapi import Depends
+
+from app import auth, auth0, crud
 from . import models, schemas
 from .database import SessionLocal
+import jwt as pyjwt
 
 router = APIRouter()
 
@@ -17,22 +20,28 @@ def get_db():
     finally:
         db.close()
 
-@router.post("/api/users/get-user-data", response_model=schemas.UserDataResponse)
-def get_user_data(request: schemas.UserDataRequest, db: Session = Depends(get_db)):
+def identify_token_type(token: str):
     try:
-        payload = jwt.decode(request.token, SECRET_KEY, algorithms=[ALGORITHM])
-        email = payload.get("sub")
-        if not email:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Token verification failed")
+        un = pyjwt.decode(token, options={"verify_signature": False})
+        return "auth0" if un.get("iss", "").startswith("https://") else "local"
+    except Exception:
+        raise HTTPException(401, "Invalid token format")
 
-    user = db.query(models.User).filter(models.User.email == email).first()
+def decode_token(token: str):
+    typ = identify_token_type(token)
+    if typ == "local":
+        try:
+            return pyjwt.decode(token, auth.AUTHOR_SECRET_KEY, algorithms=["HS256"])
+        except pyjwt.PyJWTError:
+            raise HTTPException(401, "Invalid local token")
+    else:
+        return auth0.verify_auth0_token(token)
+
+@app.post("/api/users/get-user-data", response_model=schemas.UserDataResponse)
+def get_user_data(request: schemas.UserDataRequest, db: Session = Depends(auth.get_db)):
+    payload = decode_token(request.token)
+    email = payload.get("email") or payload.get("sub")
+    user = crud.get_user_by_email(db, email)
     if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    return schemas.UserDataResponse(
-        id=user.id,
-        fullName=user.full_name,
-        email=user.email
-    )
+        user = crud.create_user(db, payload.get("name", email), email, "", auth_type="auth0")
+    return schemas.UserDataResponse(id=user.id, fullName=user.full_name, email=user.email)
